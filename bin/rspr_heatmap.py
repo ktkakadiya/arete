@@ -302,8 +302,8 @@ def read_tree(input_path):
         return Phylo.read(io.StringIO(formatted), "newick")
 
 def write_tree(output_path, data):
-    with open(output_path, "w") as f:
-        f.write(data) 
+    Phylo.write(data, output_path, "newick")
+    print(data)
 
 def get_fig_size(refer_tree):
     max_fig_size = 100
