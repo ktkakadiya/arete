@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import argparse
 import subprocess
+import shutil
 from ete3 import Tree
 import pandas as pd
 from collections import defaultdict
@@ -15,6 +16,7 @@ from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 import seaborn as sns
 import tempfile
+import logging
 
 
 #####################################################################
@@ -85,12 +87,22 @@ def parse_args(args=None):
     )
     return parser.parse_args(args)
 
+def check_formatted_tree(tree_string):
+    """Check if formatted tree has duplicate nodes"""
+
+    pattern = r'([a-zA-Z]+\w{3,}):.*\1'
+    match = re.search(pattern, tree_string)
+
+    return bool(match)
 
 def read_tree(input_path):
     with open(input_path, "r") as f:
         tree_string = f.read()
         formatted = re.sub(r";[^:]+:", ":", tree_string)
-        return Tree(formatted)
+        is_duplicated = check_formatted_tree(formatted)
+        is_small = formatted.count(",") < 3
+
+        return Tree(formatted), is_duplicated, is_small
 
 
 #####################################################################
@@ -102,12 +114,32 @@ def read_tree(input_path):
 #####################################################################
 
 
-def root_tree(input_path, output_path):
-    tre = read_tree(input_path)
+def root_tree(input_path, basename, output_path):
+    tre,is_duplicated,is_small = read_tree(input_path)
     midpoint = tre.get_midpoint_outgroup()
     tre.set_outgroup(midpoint)
-    if not os.path.exists(os.path.dirname(output_path)):
-        os.makedirs(os.path.dirname(output_path))
+    if is_duplicated:
+        outdir = Path(output_path) / "multiple"
+        Path(outdir).mkdir(exist_ok=True, parents=True)
+        output_path = outdir / basename
+        output_path = str(output_path).replace(".tre", ".tre.multiple")
+    elif is_small:
+        outdir = Path(output_path) / "small"
+        Path(outdir).mkdir(exist_ok=True, parents=True)
+        output_path = outdir / basename
+        output_path = str(output_path).replace(".tre", ".tre.small")
+    else:
+        outdir = Path(output_path) / "unique"
+        Path(outdir).mkdir(exist_ok=True, parents=True)
+        output_path = outdir / basename
+
+    tre.write(outfile=output_path)
+    return tre.write(), len(tre.get_leaves()), output_path, is_duplicated, is_small
+
+def root_reference_tree(input_path, output_path):
+    tre, _, _ = read_tree(input_path)
+    midpoint = tre.get_midpoint_outgroup()
+    tre.set_outgroup(midpoint)
     tre.write(outfile=output_path)
     return tre.write(), len(tre.get_leaves())
 
@@ -125,7 +157,6 @@ def root_tree(input_path, output_path):
 
 
 def root_trees(core_tree, gene_trees_path, output_dir, results, merge_pair=False):
-    print("Rooting trees")
     #'''
     reference_tree = core_tree
 
@@ -135,20 +166,23 @@ def root_trees(core_tree, gene_trees_path, output_dir, results, merge_pair=False
     rooted_reference_tree = os.path.join(
         output_dir, "rooted_reference_tree/core_gene_alignment.tre"
     )
-    refer_content, refer_tree_size = root_tree(reference_tree, rooted_reference_tree)
+    refer_content, refer_tree_size = root_reference_tree(reference_tree, rooted_reference_tree)
 
     df_gene_trees = pd.read_csv(gene_trees_path)
     rooted_gene_trees_path = os.path.join(output_dir, "rooted_gene_trees")
     for filename in df_gene_trees["path"]:
         basename = Path(filename).name
-        rooted_gene_tree_path = os.path.join(rooted_gene_trees_path, basename)
-        gene_content, gene_tree_size = root_tree(filename, rooted_gene_tree_path)
-        results.loc[basename, "tree_size"] = gene_tree_size
+        gene_content, gene_tree_size, gene_tree_path, is_duplicated, is_small = root_tree(
+                                                                filename,
+                                                                basename,
+                                                                rooted_gene_trees_path)
+        if not (is_duplicated or is_small):
+            results.loc[basename, "tree_size"] = gene_tree_size
         if merge_pair:
-            with open(rooted_gene_tree_path, "w") as f2:
+            with open(gene_tree_path, "w") as f2:
                 f2.write(refer_content + "\n" + gene_content)
     #'''
-    return rooted_gene_trees_path
+    return os.path.join(rooted_gene_trees_path, "unique")
 
 
 #####################################################################
@@ -178,6 +212,9 @@ def extract_approx_distance(text):
 
 def run_approx_rspr(results, input_file, lst_filename, rspr_path):
     input_file.seek(0)
+
+    command_exists = shutil.which(rspr_path[0])
+
     result = subprocess.run(
         rspr_path, stdin=input_file, capture_output=True, text=True
     )
@@ -204,7 +241,6 @@ def run_approx_rspr(results, input_file, lst_filename, rspr_path):
 def approx_rspr(
     rooted_gene_trees_path, results, min_branch_len=0, max_support_threshold=0.7
 ):
-    print("Calculating approx distance")
     rspr_path = [
         "rspr",
         "-approx",
@@ -212,26 +248,79 @@ def approx_rspr(
         "-length " + str(min_branch_len),
         "-support " + str(max_support_threshold),
     ]
-    
+
     group_size = 10000
     cur_count = 0
     lst_filename = []
     with tempfile.TemporaryFile(mode='w+') as temp_file:
         for filename in os.listdir(rooted_gene_trees_path):
-            if cur_count == group_size:
-                run_approx_rspr(results, temp_file, lst_filename, rspr_path)
-                temp_file.seek(0)
-                temp_file.truncate()
-                lst_filename.clear()
-                cur_count = 0
+            if str(filename) in results.index:
+                print("Found " + str(filename))
+                if cur_count == group_size:
+                    run_approx_rspr(results, temp_file, lst_filename, rspr_path)
+                    temp_file.seek(0)
+                    temp_file.truncate()
+                    lst_filename.clear()
+                    cur_count = 0
 
-            gene_tree_path = os.path.join(rooted_gene_trees_path, filename)
-            with open(gene_tree_path, "r") as infile:
-                temp_file.write(infile.read() + "\n")
-                lst_filename.append(filename)
-                cur_count += 1
-        if cur_count > 0:
-            run_approx_rspr(results, temp_file, lst_filename, rspr_path)
+                gene_tree_path = os.path.join(rooted_gene_trees_path, filename)
+                with open(gene_tree_path, "r") as infile:
+                    lines = infile.readlines()
+                    if len(lines) < 2:
+                        print(f"File {filename} does not have enough lines.")
+                        continue
+                    tree = Tree(lines[1].strip())
+                    # Calculate N: number of nodes at or above the support threshold
+                    # num_resolved = sum(1 for node in tree.traverse() if node.support >= max_support_threshold and not node.is_leaf())
+                    num_resolved = -1
+                    for node in tree.traverse():
+                        if node.support is not None and node.support >= max_support_threshold and not node.is_leaf():
+                            num_resolved += 1
+
+                    tree_size = len(tree.get_leaves())
+                    results.loc[filename, "Num resolved"] = num_resolved
+                    results.loc[filename, "N/tree_size"] = num_resolved / tree_size if tree_size > 0 else 0
+                    lst_filename.append(filename)
+                    temp_file.write(lines[0].strip() + "\n" + lines[1].strip() + "\n")
+                    cur_count += 1
+                if cur_count > 0:
+                    run_approx_rspr(results, temp_file, lst_filename, rspr_path)
+
+    # Add the approx_drSPR/N column
+    results["approx_drSPR/N"] = results.apply(lambda row: float(row["approx_drSPR"]) / row["Num resolved"] if row["Num resolved"] > 0 else 0, axis=1)
+    print("CBA " + str(results))
+
+#def approx_rspr_old(
+#    rooted_gene_trees_path, results, min_branch_len=0, max_support_threshold=0.7
+#):
+#    print("Calculating approx distance")
+#    rspr_path = [
+#        "rspr",
+#        "-approx",
+#        "-multifurcating",
+#        "-length " + str(min_branch_len),
+#        "-support " + str(max_support_threshold),
+#    ]
+#
+#    group_size = 10000
+#    cur_count = 0
+#    lst_filename = []
+#    with tempfile.TemporaryFile(mode='w+') as temp_file:
+#        for filename in os.listdir(rooted_gene_trees_path):
+#            if cur_count == group_size:
+#                run_approx_rspr(results, temp_file, lst_filename, rspr_path)
+#                temp_file.seek(0)
+#                temp_file.truncate()
+#                lst_filename.clear()
+#                cur_count = 0
+#
+#            gene_tree_path = os.path.join(rooted_gene_trees_path, filename)
+#            with open(gene_tree_path, "r") as infile:
+#                temp_file.write(infile.read() + "\n")
+#                lst_filename.append(filename)
+#                cur_count += 1
+#        if cur_count > 0:
+#            run_approx_rspr(results, temp_file, lst_filename, rspr_path)
 
 
 #####################################################################
@@ -262,7 +351,6 @@ def generate_heatmap(freq_table, output_path, log_scale=False):
 #####################################################################
 
 def make_heatmap(results, output_path, min_distance, max_distance):
-    print("Generating heatmap")
 
     # create sub dataframe
     sub_results = results[(results["approx_drSPR"] >= min_distance)]
@@ -279,7 +367,6 @@ def make_heatmap(results, output_path, min_distance, max_distance):
 
 
 def make_heatmap_from_tsv(input_path, output_path, min_distance, max_distance):
-    print("Generating heatmap from CSV")
     results = pd.read_table(input_path)
     make_heatmap(results, output_path, min_distance, max_distance)
 
@@ -312,7 +399,6 @@ def get_heatmap_group_size(all_values, max_groups=15):
 #####################################################################
 
 def make_group_heatmap(results, output_path, min_distance, max_distance):
-    print("Generating group heatmap")
 
     # create sub dataframe
     sub_results = results[(results["approx_drSPR"] >= min_distance)]
@@ -356,7 +442,7 @@ def make_group_heatmap(results, output_path, min_distance, max_distance):
 ### RETURN groups of trees
 #####################################################################
 
-def generate_group_sizes(target_sum, max_groups=500):
+def generate_group_sizes(target_sum, max_groups=1000):
     degree = 1
     current_sum = 0
     group_sizes = []
@@ -383,7 +469,6 @@ def generate_group_sizes(target_sum, max_groups=500):
 #####################################################################
 
 def make_groups_v1(results, min_limit=10):
-    print("Generating groups")
     min_group = results[results["approx_drSPR"] <= min_limit]["file_name"].tolist()
     groups = defaultdict()
     first_group = "group_0"
@@ -411,7 +496,6 @@ def make_groups_v1(results, min_limit=10):
 #####################################################################
 
 def make_groups(results, min_limit=10):
-    print("Generating groups")
     min_group = results[results["approx_drSPR"] <= min_limit]["file_name"].tolist()
     groups = defaultdict()
     first_group = "group_0"
@@ -436,7 +520,6 @@ def make_groups(results, min_limit=10):
 
 
 def make_groups_from_csv(input_df, min_limit):
-    print("Generating groups from CSV")
     groups = make_groups_v1(input_df, min_limit)
     tidy_data = [
         (key, val)
@@ -448,6 +531,24 @@ def make_groups_from_csv(input_df, min_limit):
 
     return merged
 
+
+# def join_annotation_data(df, annotation_data):
+#    ann_df = pd.read_table(annotation_data, dtype={"genome_id": "str"})
+#    ann_df.columns = map(str.lower, ann_df.columns)
+#    ann_df.columns = ann_df.columns.str.replace(" ", "_")
+#    ann_subset = ann_df[["gene", "product"]]
+#
+#    df["tree_name"] = [f.split(".")[0] for f in df["file_name"]]
+#
+#    merged = df.merge(ann_subset, how="left", left_on="tree_name", right_on="gene")
+#
+#    if merged["gene"].isnull().all():
+#        ann_subset = ann_df[["locus_tag", "gene", "product"]]
+#        merged = df.merge(
+#            ann_subset, how="left", left_on="tree_name", right_on="locus_tag"
+#        )
+#
+#    return merged.fillna(value="NULL").drop("tree_name", axis=1).drop_duplicates()
 
 def join_annotation_data(df, annotation_data):
     ann_df = pd.read_table(annotation_data, dtype={"genome_id": "str"})
@@ -465,8 +566,23 @@ def join_annotation_data(df, annotation_data):
             ann_subset, how="left", left_on="tree_name", right_on="locus_tag"
         )
 
-    return merged.fillna(value="NULL").drop("tree_name", axis=1).drop_duplicates()
+    merged = merged.fillna("NULL").drop("tree_name", axis=1)
 
+    # Group by all columns except 'product' and aggregate 'product'
+    grouped = (
+        merged.groupby(list(merged.columns.difference(['product'])))
+        .agg({'product': lambda x: '||'.join(sorted(set(x)))})
+        .reset_index()
+    )
+
+        # Reorder columns
+    desired_order = [
+        "file_name", "gene", "tree_size", "product", "N/tree_size",
+        "Num resolved", "approx_drSPR", "approx_drSPR/N"
+    ]
+    grouped = grouped[desired_order]
+
+    return grouped.drop_duplicates()
 
 def main(args=None):
     args = parse_args(args)
@@ -485,7 +601,10 @@ def main(args=None):
         args.MAX_SUPPORT_THRESHOLD,
     )
 
+    #exit(11)
+
     # Generate standard heatmap
+    # results["approx_drSPR"] = pd.to_numeric(results["approx_drSPR"]).fillna(1000000)
     results["approx_drSPR"] = pd.to_numeric(results["approx_drSPR"])
     fig_path = os.path.join(args.OUTPUT_DIR, "output.png")
     make_heatmap(
@@ -498,7 +617,7 @@ def main(args=None):
     # Generate group heatmap
     group_fig_path = os.path.join(args.OUTPUT_DIR, "group_output.png")
     make_group_heatmap(
-        results, 
+        results,
         group_fig_path,
         args.MIN_HEATMAP_RSPR_DISTANCE,
         args.MAX_HEATMAP_RSPR_DISTANCE
